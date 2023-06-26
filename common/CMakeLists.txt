@@ -1,0 +1,5 @@
+add_subdirectory(exe)
+add_subdirectory(gst)
+add_subdirectory(net)
+add_subdirectory(dir)
+add_subdirectory(po)
