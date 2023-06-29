@@ -14,34 +14,39 @@
 
 namespace
 {
+    namespace asio  = boost::asio;
     namespace beast = boost::beast;
     namespace http  = boost::beast::http;
-    namespace asio  = boost::asio;
-    using tcp       = boost::asio::ip::tcp;
-
+    namespace fs    = std::filesystem;
+    using tcp = asio::ip::tcp;
 }  // namespace
 
 namespace net
 {
-    template<exe::ExecutionContextType Context>
+    using Resolver  = asio::use_awaitable_t<>::as_default_on_t<tcp::resolver>;
+    using TcpStream = asio::use_awaitable_t<>::as_default_on_t<beast::tcp_stream>;
+
+    template<exe::ExecutionContext Context>
     struct ClientEndpoint
     {
-        ClientEndpoint(Context& context, std::int64_t timeout) : _context{ context }, _timeout{timeout} { }
-
-        asio::awaitable<void> sendFile(const std::string& host, const std::string& port,
-                                       const std::filesystem::path& imagePath)
+        ClientEndpoint(Context& context, std::string host, std::string port, std::int64_t timeout)
+            : _context{ context }, _host{ std::move(host) }, _port{ std::move(port) }, _timeout{ timeout }
         {
-            auto resolver = asio::use_awaitable.as_default_on(tcp::resolver(co_await asio::this_coro::executor));
-            auto stream   = asio::use_awaitable.as_default_on(beast::tcp_stream(co_await asio::this_coro::executor));
+        }
 
-            auto const results = co_await resolver.async_resolve(host, port);
+        asio::awaitable<void> sendFile(fs::path imagePath)
+        {
+            Resolver resolver{ _context };
+            TcpStream stream{ _context };
+
+            auto const results = co_await resolver.async_resolve(_host, _port);
 
             stream.expires_after(_timeout);
             co_await stream.async_connect(results);
             spdlog::info("Connected to the server");
 
             stream.expires_after(_timeout);
-            auto req = prepareRequest(host, imagePath);
+            auto req = prepareRequest(imagePath);
             co_await http::async_write(stream, req);
             spdlog::info("Request sent");
 
@@ -59,21 +64,21 @@ namespace net
         }
 
     private:
-        http::request<http::file_body> prepareRequest(const std::string& host, const std::filesystem::path& imagePath)
+        http::request<http::file_body> prepareRequest(const fs::path& imagePath)
         {
             boost::beast::error_code ec;
             http::file_body::value_type body;
             body.open(imagePath.c_str(), boost::beast::file_mode::read, ec);
 
             if (ec == beast::errc::no_such_file_or_directory)
-                throw;
+                throw std::runtime_error("Can't open image file");
 
             http::request<http::file_body> req;
 
             req.method(http::verb::post);
             req.target("/screenshot");
             req.version(11);
-            req.set(http::field::host, host);
+            req.set(http::field::host, _host);
             req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
             req.set(http::field::content_type, "image/jpeg");
             req.body() = std::move(body);
@@ -83,6 +88,8 @@ namespace net
         }
 
         Context& _context;
+        std::string _host;
+        std::string _port;
         std::chrono::seconds _timeout;
     };
 }  // namespace net

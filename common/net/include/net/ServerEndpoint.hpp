@@ -16,41 +16,53 @@ namespace
     namespace beast = boost::beast;
     namespace http  = boost::beast::http;
     namespace asio  = boost::asio;
+    namespace fs    = std::filesystem;
     using tcp       = boost::asio::ip::tcp;
-
 }  // namespace
 
 namespace net
 {
-    using tcp_stream = typename beast::tcp_stream::rebind_executor<
-        asio::use_awaitable_t<>::executor_with_default<asio::any_io_executor>>::other;
+    using Acceptor  = asio::use_awaitable_t<>::as_default_on_t<asio::ip::tcp::acceptor>;
+    using TcpStream = asio::use_awaitable_t<>::as_default_on_t<beast::tcp_stream>;
 
-    template<exe::ExecutionContextType Context>
+    template<exe::ExecutionContext Context>
     struct ServerEndpoint
     {
-        ServerEndpoint(Context& context, const std::filesystem::path& storageDir, std::int64_t timeout)
-            : _context{ context }, _storageDir{ storageDir }, _timeout{ timeout }
+        ServerEndpoint(Context& context, const fs::path& storageDir, std::uint16_t port, std::int64_t timeout)
+            : _context{ context },
+              _storageDir{ storageDir },
+              _acceptor{ _context, { tcp::v4(), port } },
+              _timeout{ timeout },
+              _sessionId{ 0ul }
         {
         }
 
-        asio::awaitable<void> doListen(tcp::endpoint endpoint)
+        asio::awaitable<void> doListen()
         {
-            tcp::acceptor acceptor{ _context, endpoint };
-
-            while (acceptor.is_open())
+            try
             {
-                tcp::socket client = co_await acceptor.async_accept(asio::use_awaitable);
-                tcp_stream stream{ std::move(client) };
+                while (_acceptor.is_open())
+                {
+                    auto clientSocket = co_await _acceptor.async_accept();
 
-                spdlog::info("The new client accepted");
-                exe::submit(_context, doSession(std::move(stream)));
+                    TcpStream stream{ std::move(clientSocket) };
+
+                    exe::submit(_context, doSession(std::move(stream)));
+                }
             }
-            
+            catch (boost::system::system_error& se)
+            {
+                if (se.code() != boost::system::errc::operation_canceled)
+                    throw;
+            }
+
             co_return;
         }
 
+        void cancel() { _acceptor.cancel(); }
+
     private:
-        asio::awaitable<void> doSession(tcp_stream stream)
+        asio::awaitable<void> doSession(TcpStream stream)
         {
             beast::flat_buffer buffer;
 
@@ -81,7 +93,7 @@ namespace net
             }
             catch (boost::system::system_error& se)
             {
-                if (se.code() != http::error::end_of_stream)
+                if (se.code() != http::error::end_of_stream && se.code() != boost::system::errc::operation_canceled)
                     throw;
             }
         }
@@ -124,10 +136,13 @@ namespace net
                 return bad_request("Invalid image");
             }
 
-            std::ofstream file{ _storageDir / "receivedImage.jpg", std::ios::binary };
+            auto imageName = fmt::format("recimage{}.jpg", _sessionId++);
+
+            std::ofstream file{ _storageDir / imageName, std::ios::binary };
             if (!file.is_open())
             {
-                throw;
+                spdlog::error(fmt::format("Can't open image: {}", imageName));
+                throw std::runtime_error("Can't open image");
             }
 
             file << req.body();
@@ -140,9 +155,11 @@ namespace net
 
             return res;
         }
-        
+
         Context& _context;
-        std::filesystem::path _storageDir;
+        fs::path _storageDir;
+        Acceptor _acceptor;
         std::chrono::seconds _timeout;
+        std::size_t _sessionId;
     };
 }  // namespace net

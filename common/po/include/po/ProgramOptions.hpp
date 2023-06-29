@@ -23,7 +23,7 @@ namespace po
         {
             // clang-format off
             description.add_options()
-            ("ip", boost_po::value<std::string>(&serverIp)->default_value("localhost"), "Server IP address")
+            ("ip", boost_po::value<std::string>(&serverIp)->default_value("127.0.0.1"), "Server IP address")
             ("port,p", boost_po::value<std::uint16_t>(&serverPort)->required(), "Server port")
             ("outdir", boost_po::value<fs::path>(&outDir)->required(), "Output directory")
             ("timeout", boost_po::value<std::int64_t>(&timeout)->default_value(30), "Connection timeout");
@@ -52,8 +52,7 @@ namespace po
         void addOptions(boost_po::options_description& description) { CommonOptions::addOptions(description); }
     };
 
-    inline bool
-    parse(int argc, char* argv[], auto& opts)
+    inline bool parse(int argc, char* argv[], auto& opts)
     {
         boost_po::options_description description("Usage");
 

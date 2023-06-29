@@ -1,19 +1,22 @@
+set(SOURCES main.cpp ui/ServerWindow.cpp ui/ServerWindow.hpp)
 
-set(CMAKE_INCLUDE_CURRENT_DIR ON)
-
-set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_executable(server ${SOURCES})
+target_compile_features(server PUBLIC cxx_std_20)
 
-find_package(QT NAMES Qt6 Qt5 COMPONENTS Widgets REQUIRED)
-find_package(Qt${QT_VERSION_MAJOR} COMPONENTS Widgets REQUIRED)
+find_package(Qt5
+    REQUIRED COMPONENTS Core Gui Widgets)
 
-set(PROJECT_SOURCES
-        main.cpp
-)
+target_link_libraries(
+        server PRIVATE recorder_asio::exe 
+                       recorder_asio::net
+                       recorder_asio::dir
+                       recorder_asio::po)
 
-add_executable(server ${PROJECT_SOURCES})
-target_link_libraries(server PRIVATE Qt${QT_VERSION_MAJOR}::Widgets recorder_asio::exe recorder_asio::net recorder_asio::po)
+target_link_libraries(
+        server PRIVATE Qt5::Core
+                       Qt5::Gui
+                       Qt5::Widgets)
