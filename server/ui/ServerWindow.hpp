@@ -1,10 +1,9 @@
 #pragma once
 
+#include <QApplication>
 #include <QLabel>
 #include <QMainWindow>
 #include <filesystem>
-
-#include "Events.hpp"
 
 namespace ui
 {
@@ -20,6 +19,7 @@ namespace ui
 
     signals:
         void requestUpdate(const std::filesystem::path& imagePath);
+        void requestQuit();
 
     private slots:
         void updateImage(const std::filesystem::path& imagePath);

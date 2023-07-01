@@ -11,115 +11,102 @@
 #include "net/ClientEndpoint.hpp"
 #include "po/ProgramOptions.hpp"
 
-namespace asio = boost::asio;
-namespace fs   = std::filesystem;
-
-boost::asio::awaitable<void> uploadImages(exe::ExecutionContext auto& context, const po::ClientOptions& opts)
+namespace
 {
-    net::ClientEndpoint endpoint{ context, opts.serverIp, std::to_string(opts.serverPort), opts.timeout };
-    dir::Monitor monitor{ context, opts.outDir };
+  namespace asio = boost::asio;
+  namespace fs   = std::filesystem;
+}  // namespace
 
-    asio::cancellation_state state = co_await asio::this_coro::cancellation_state;
-    state.slot().assign([&](auto /*type*/) { monitor.cancel(); });
+boost::asio::awaitable<void> uploadImages(const po::ClientOptions& opts)
+{
+  auto executor = co_await asio::this_coro::executor;
+  auto state    = co_await asio::this_coro::cancellation_state;
 
-    while (true)
+  net::ClientEndpoint endpoint{ executor, opts.serverIp, std::to_string(opts.serverPort), opts.timeout };
+  dir::Monitor monitor{ executor, opts.outDir, IN_MOVED_TO };
+
+  while (true)
+  {
+    fs::path imagePath = co_await monitor.getNewImage1();
+    if (!imagePath.empty())
     {
-        spdlog::warn("ispred monitora {}", std::this_thread::get_id());
-        auto imagePath = co_await monitor.getNewImage(boost::asio::use_awaitable);
-
-        if (state.cancelled() != asio::cancellation_type::none)
-        {
-            spdlog::critical("Canceling images upload...");
-            co_return;
-        }
-
-        spdlog::info("New image found: {}", imagePath);
-        spdlog::warn("ispred endpointa {}", std::this_thread::get_id());
-        exe::submit(context, endpoint.sendFile(std::move(imagePath)));
+      co_await endpoint.sendFile(std::move(imagePath));
     }
 
-    co_return;
+    if (state.cancelled() != asio::cancellation_type::none)
+    {
+      spdlog::critical("Canceling uploadImages coroutine...");
+      co_return;
+    }
+  }
 }
 
-boost::asio::awaitable<void> takeCameraShots(exe::ExecutionContext auto& context, const po::ClientOptions& opts)
+boost::asio::awaitable<void> takeCameraShots(const po::ClientOptions& opts)
 {
-    asio::system_context ctx;
-    gst::Camera camera{ ctx, opts.videoDevice, opts.outDir };
+  auto executor = co_await asio::this_coro::executor;
+  auto state    = co_await asio::this_coro::cancellation_state;
 
-    asio::cancellation_state state = co_await asio::this_coro::cancellation_state;
-    state.slot().assign([&](auto /*type*/) { camera.cancel(); });
+  gst::Camera camera{ executor, opts.videoDevice, opts.outDir };
 
-    while (true)
+  while (true)
+  {
+    gst::PipelineMessage msg = co_await camera.take1();
+
+    if (state.cancelled() != asio::cancellation_type::none)
     {
-        spdlog::warn("ispred camere {}", std::this_thread::get_id());
-        gst::PipelineMessage msg = co_await camera.take(boost::asio::use_awaitable);
-
-        if (state.cancelled() != asio::cancellation_type::none)
-        {
-            spdlog::critical("Canceling takeCameraShots coroutine");
-            co_return;
-        }
-
-        if (msg != gst::PipelineMessage::EoS)
-            co_return;
+      spdlog::critical("Canceling takeCameraShots coroutine...");
+      co_return;
     }
+
+    if (msg != gst::PipelineMessage::EoS)
+    {
+      spdlog::error("Error received from pipeline!");
+      throw std::runtime_error("Pipeline error");
+    }
+  }
 }
 
-asio::awaitable<void> asyncMain(exe::ExecutionContext auto& context, const po::ClientOptions& opts)
+asio::awaitable<void> asyncMain(const po::ClientOptions& opts)
 {
-    spdlog::info("Starting the async main...");
-    using namespace asio::experimental::awaitable_operators;
+  spdlog::info("Starting the async main...");
 
-    try
-    {
-        co_await (takeCameraShots(context, opts) && uploadImages(context, opts));
-    }
-    catch (const std::exception& ex)
-    {
-        spdlog::error("Exception thrown from asyncMain: ");
-        spdlog::error("{}", ex.what());
-    }
+  try
+  {
+    co_await exe::whenAll(takeCameraShots(opts), uploadImages(opts));
+  }
+  catch (const std::exception& ex)
+  {
+    spdlog::error("Exception thrown from asyncMain: ");
+    spdlog::error("{}", ex.what());
+  }
 
-    spdlog::info("Exiting the async main...");
-    co_return;
+  spdlog::info("Exiting the async main...");
+  co_return;
 }
 
 int main(int argc, char* argv[])
 {
-    try
+  try
+  {
+    po::ClientOptions opts;
+    if (!po::parse(argc, argv, opts))
     {
-        po::ClientOptions opts;
-        if (!po::parse(argc, argv, opts))
-        {
-            return EXIT_FAILURE;
-        }
-
-        gst_init(nullptr, nullptr);
-
-        asio::io_context io;
-        asio::thread_pool pool{ 3ul };
-
-        using namespace asio::experimental::awaitable_operators;
-        
-        const auto now = std::chrono::high_resolution_clock::now();
-
-        exe::submit(io, asyncMain(io, opts) || exe::stopOnSignals(io, SIGINT) || exe::stopAfter(io, std::chrono::seconds(15)));
-
-        exe::submit(pool, [&]() { io.run(); });
-        exe::submit(pool, [&]() { io.run(); });
-        exe::submit(pool, [&]() { io.run(); });
-        io.run();
-
-        const auto now1 = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> ms_double = now1 - now;
-        std::cout << ms_double.count() << "ms\n";
-
-    }
-    catch (const std::exception& e)
-    {
-        spdlog::error("{}", e.what());
-        return EXIT_FAILURE;
+      return EXIT_FAILURE;
     }
 
-    return EXIT_SUCCESS;
+    gst_init(nullptr, nullptr);
+
+    asio::io_context io;
+
+    exe::whenOneOf(io, asyncMain(opts), exe::stopOnSignals(SIGINT), exe::stopAfter(opts.recTime));
+
+    io.run();
+  }
+  catch (const std::exception& e)
+  {
+    spdlog::error("{}", e.what());
+    return EXIT_FAILURE;
+  }
+
+  return EXIT_SUCCESS;
 }

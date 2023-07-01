@@ -12,108 +12,93 @@
 
 namespace
 {
-    namespace asio = boost::asio;
-    namespace fs   = std::filesystem;
+  namespace asio = boost::asio;
+  namespace fs   = std::filesystem;
+  using FileDesc = asio::use_awaitable_t<>::as_default_on_t<asio::posix::stream_descriptor>;
 }  // namespace
 
 namespace gst
 {
-    enum class PipelineMessage
+  enum class PipelineMessage
+  {
+    Idle,
+    EoS,
+    Error
+  };
+
+  struct Camera
+  {
+    Camera(const exe::Executor auto& executor, const fs::path &cameraDevice, const fs::path &path)
+        : _pipeline{ fmt::format(_config, cameraDevice.c_str(), path.c_str()) },
+          _streamDesc{ executor, _pipeline.getPollFd() }
     {
-        Idle,
-        EoS,
-        Error
-    };
+      if (!_pipeline)
+      {
+        throw std::runtime_error("Failed to create pipeline");
+      }
+    }
 
-    template<exe::ExecutionContext Context>
-    struct Camera
+    asio::awaitable<PipelineMessage> take1()
     {
-        Camera(Context &context, const fs::path &cameraDevice, const fs::path &path)
-            : _context{ context },
-              _pipeline{ fmt::format(_config, cameraDevice.c_str(), path.c_str()) },
-              _streamDesc{ _context, _pipeline.getPollFd() }
+      PipelineMessage result = PipelineMessage::Idle;
+      _pipeline.play();
+
+      try
+      {
+        while (true)
         {
-            if (!_pipeline)
+          co_await _streamDesc.async_wait(asio::posix::stream_descriptor::wait_read);
+
+          GstMessage *message = _pipeline.getMessage();
+
+          if (message)
+          {
+            if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
             {
-                throw std::runtime_error("Failed to create pipeline");
+              GError *err;
+              char *debugInfo;
+              gst_message_parse_error(message, &err, &debugInfo);
+
+              spdlog::error("Error received from element {}: {}", GST_OBJECT_NAME(message->src), err->message);
+              spdlog::error("{}", debugInfo ? debugInfo : "none");
+
+              g_clear_error(&err);
+              g_free(debugInfo);
+
+              result = PipelineMessage::Error;
             }
-        }
-
-        template<typename CompleteToken>
-        auto take(CompleteToken &&token)
-        {
-            return asio::async_initiate<CompleteToken, void(PipelineMessage)>(
-                [this](auto handler)
-                {
-                    _pipeline.play();
-                    exe::submit(_context, handleMessages(std::move(handler)));
-                },
-                token);
-        }
-
-        void cancel() { _streamDesc.cancel(); }
-        ~Camera() noexcept { _pipeline.stop(); }
-
-    private:
-        template<typename CompleteHandler>
-        asio::awaitable<void> handleMessages(CompleteHandler handler)
-        {
-            PipelineMessage result = PipelineMessage::Idle;
-
-            try
+            else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS)
             {
-                while (true)
-                {
-                    spdlog::warn(" ispred camera co_await _streamDesc.async_wait {}", std::this_thread::get_id());
-                    co_await _streamDesc.async_wait(asio::posix::stream_descriptor::wait_read, asio::use_awaitable);
-                    spdlog::warn(" iza camera co_await _streamDesc.async_wait {}", std::this_thread::get_id());
-                    GstMessage *message = _pipeline.getMessage();
-
-                    if (message)
-                    {
-                        if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_ERROR)
-                        {
-                            GError *err;
-                            char *debugInfo;
-                            gst_message_parse_error(message, &err, &debugInfo);
-
-                            spdlog::error("Error received from element {}: {}", GST_OBJECT_NAME(message->src), err->message);
-                            spdlog::error("{}", debugInfo ? debugInfo : "none");
-
-                            g_clear_error(&err);
-                            g_free(debugInfo);
-
-                            result = PipelineMessage::Error;
-                        }
-                        else if (GST_MESSAGE_TYPE(message) == GST_MESSAGE_EOS)
-                        {
-                            result = PipelineMessage::EoS;
-                        }
-                        else
-                        {
-                            spdlog::critical("Unsupported type of message");
-                        }
-
-                        exe::submit(_context, std::move(handler), result);
-                        
-                        _pipeline.stop();
-                        gst_message_unref(message);  // FIXME: RAII
-                        co_return;
-                    }
-                }
+              result = PipelineMessage::EoS;
             }
-            catch (const std::exception &e)
+            else
             {
-                spdlog::critical("exception");
-                exe::submit(_context, [handler = std::move(handler), result]() mutable { handler(result); });
+              spdlog::critical("Unsupported type of message");
             }
-        }
 
-        Context &_context;
-        fs::path _path;
-        Pipeline _pipeline;
-        asio::posix::stream_descriptor _streamDesc;
-        static constexpr const char *_config =
-            "v4l2src device={} num-buffers=1 ! jpegenc !  multifilesink location={}/image\%d.jpg";
-    };
+            _pipeline.stop();
+            gst_message_unref(message);
+            break;
+          }
+        }
+      }
+      catch (boost::system::system_error &se)
+      {
+        if (se.code() != boost::system::errc::operation_canceled)
+          throw;
+      }
+
+      co_return result;
+    }
+
+    void cancel() { _streamDesc.cancel(); }
+    ~Camera() noexcept { _pipeline.stop(); }
+
+  private:
+    fs::path _path;
+    Pipeline _pipeline;
+    FileDesc _streamDesc;
+    static constexpr const char *_config =
+        "v4l2src device={} num-buffers=1 ! jpegenc !  multifilesink location={}/image\%d.jpg";
+  };
 }  // namespace gst

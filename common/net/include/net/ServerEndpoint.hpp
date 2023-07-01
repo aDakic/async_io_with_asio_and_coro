@@ -13,153 +13,135 @@
 
 namespace
 {
-    namespace beast = boost::beast;
-    namespace http  = boost::beast::http;
-    namespace asio  = boost::asio;
-    namespace fs    = std::filesystem;
-    using tcp       = boost::asio::ip::tcp;
+  namespace beast = boost::beast;
+  namespace http  = boost::beast::http;
+  namespace asio  = boost::asio;
+  namespace fs    = std::filesystem;
+  using tcp       = boost::asio::ip::tcp;
+  using Acceptor  = asio::use_awaitable_t<>::as_default_on_t<asio::ip::tcp::acceptor>;
+  using TcpStream = asio::use_awaitable_t<>::as_default_on_t<beast::tcp_stream>;
 }  // namespace
 
 namespace net
 {
-    using Acceptor  = asio::use_awaitable_t<>::as_default_on_t<asio::ip::tcp::acceptor>;
-    using TcpStream = asio::use_awaitable_t<>::as_default_on_t<beast::tcp_stream>;
-
-    template<exe::ExecutionContext Context>
-    struct ServerEndpoint
+  struct ServerEndpoint
+  {
+    ServerEndpoint(const exe::Executor auto& executor, const fs::path& storageDir, std::uint16_t port, std::int64_t timeout)
+        : _storageDir{ storageDir }, _acceptor{ executor, { tcp::v4(), port } }, _timeout{ timeout }, _sessionId{ 0ul }
     {
-        ServerEndpoint(Context& context, const fs::path& storageDir, std::uint16_t port, std::int64_t timeout)
-            : _context{ context },
-              _storageDir{ storageDir },
-              _acceptor{ _context, { tcp::v4(), port } },
-              _timeout{ timeout },
-              _sessionId{ 0ul }
+    }
+
+    asio::awaitable<void> doListen()
+    {
+      auto executor = co_await asio::this_coro::executor;
+
+      try
+      {
+        while (_acceptor.is_open())
         {
+          auto clientSocket = co_await _acceptor.async_accept();
+          TcpStream stream{ std::move(clientSocket) };
+
+          exe::submit(executor, doSession(std::move(stream)));
         }
+      }
+      catch (boost::system::system_error& se)
+      {
+        if (se.code() != boost::system::errc::operation_canceled)
+          throw;
+      }
 
-        asio::awaitable<void> doListen()
-        {
-            try
-            {
-                while (_acceptor.is_open())
-                {
-                    auto clientSocket = co_await _acceptor.async_accept();
+      co_return;
+    }
 
-                    TcpStream stream{ std::move(clientSocket) };
+    void cancel() { _acceptor.cancel(); }
 
-                    exe::submit(_context, doSession(std::move(stream)));
-                }
-            }
-            catch (boost::system::system_error& se)
-            {
-                if (se.code() != boost::system::errc::operation_canceled)
-                    throw;
-            }
+  private:
+    asio::awaitable<void> doSession(TcpStream stream)
+    {
+      beast::flat_buffer buffer;
 
-            co_return;
-        }
+      try
+      {
+        stream.expires_after(_timeout);
+        http::request<http::string_body> req;
+        co_await http::async_read(stream, buffer, req);
 
-        void cancel() { _acceptor.cancel(); }
+        http::message_generator msg = handleRequest(std::move(req));
 
-    private:
-        asio::awaitable<void> doSession(TcpStream stream)
-        {
-            beast::flat_buffer buffer;
+        co_await beast::async_write(stream, std::move(msg));
 
-            try
-            {
-                while (true)
-                {
-                    stream.expires_after(_timeout);
+        stream.socket().shutdown(tcp::socket::shutdown_send);
+        co_return;
+      }
+      catch (boost::system::system_error& se)
+      {
+        if (se.code() != http::error::end_of_stream && se.code() != boost::system::errc::operation_canceled)
+          throw;
+      }
 
-                    http::request<http::string_body> req;
-                    co_await http::async_read(stream, buffer, req);
+      stream.socket().shutdown(tcp::socket::shutdown_send);
+      co_return;
+    }
 
-                    http::message_generator msg = handleRequest(std::move(req));
+    template<class Body, class Allocator>
+    http::message_generator handleRequest(http::request<Body, http::basic_fields<Allocator>>&& req)
+    {
+      // Returns a bad request response
+      auto const bad_request = [&req](beast::string_view why)
+      {
+        http::response<http::string_body> res{ http::status::bad_request, req.version() };
+        res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+        res.set(http::field::content_type, "text/html");
+        res.keep_alive(req.keep_alive());
+        res.body() = std::string(why);
+        res.prepare_payload();
+        return res;
+      };
 
-                    bool keepAlive = msg.keep_alive();
+      // Returns a server error response
+      auto const server_error = [&req](beast::string_view what)
+      {
+        http::response<http::string_body> res{ http::status::internal_server_error, req.version() };
+        res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+        res.set(http::field::content_type, "text/html");
+        res.keep_alive(req.keep_alive());
+        res.body() = "An error occurred: '" + std::string(what) + "'";
+        res.prepare_payload();
+        return res;
+      };
 
-                    co_await beast::async_write(stream, std::move(msg), asio::use_awaitable);
+      if (req.method() != http::verb::post)
+        return bad_request("Unknown HTTP-method");
 
-                    if (!keepAlive)
-                    {
-                        spdlog::critical("Connection closed!");
-                        break;
-                    }
+      if (req.target() != "/screenshot")
+        return bad_request("Illegal request-target");
 
-                    stream.socket().shutdown(tcp::socket::shutdown_send);
-                    co_return;
-                }
-            }
-            catch (boost::system::system_error& se)
-            {
-                if (se.code() != http::error::end_of_stream && se.code() != boost::system::errc::operation_canceled)
-                    throw;
-            }
-        }
+      if (req.body().size() == 0)
+      {
+        return bad_request("Invalid image");
+      }
 
-        template<class Body, class Allocator>
-        http::message_generator handleRequest(http::request<Body, http::basic_fields<Allocator>>&& req)
-        {
-            // Returns a bad request response
-            auto const bad_request = [&req](beast::string_view why)
-            {
-                http::response<http::string_body> res{ http::status::bad_request, req.version() };
-                res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-                res.set(http::field::content_type, "text/html");
-                res.keep_alive(req.keep_alive());
-                res.body() = std::string(why);
-                res.prepare_payload();
-                return res;
-            };
+      auto imageName = fmt::format("recimage{}.jpg", _sessionId++);
 
-            // Returns a server error response
-            auto const server_error = [&req](beast::string_view what)
-            {
-                http::response<http::string_body> res{ http::status::internal_server_error, req.version() };
-                res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-                res.set(http::field::content_type, "text/html");
-                res.keep_alive(req.keep_alive());
-                res.body() = "An error occurred: '" + std::string(what) + "'";
-                res.prepare_payload();
-                return res;
-            };
+      std::ofstream file{ _storageDir / imageName, std::ios::binary };
+      if (!file.is_open())
+      {
+        throw std::runtime_error("Can't open file for writing");
+      }
 
-            if (req.method() != http::verb::post)
-                return bad_request("Unknown HTTP-method");
+      file << req.body();
 
-            if (req.target() != "/screenshot")
-                return bad_request("Illegal request-target");
+      http::response<http::empty_body> res{ http::status::ok, req.version() };
+      res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
+      res.keep_alive(req.keep_alive());
 
-            if (req.body().size() == 0)
-            {
-                return bad_request("Invalid image");
-            }
+      return res;
+    }
 
-            auto imageName = fmt::format("recimage{}.jpg", _sessionId++);
-
-            std::ofstream file{ _storageDir / imageName, std::ios::binary };
-            if (!file.is_open())
-            {
-                spdlog::error(fmt::format("Can't open image: {}", imageName));
-                throw std::runtime_error("Can't open image");
-            }
-
-            file << req.body();
-
-            spdlog::info("New image received!");
-
-            http::response<http::empty_body> res{ http::status::ok, req.version() };
-            res.set(http::field::server, BOOST_BEAST_VERSION_STRING);
-            res.keep_alive(req.keep_alive());
-
-            return res;
-        }
-
-        Context& _context;
-        fs::path _storageDir;
-        Acceptor _acceptor;
-        std::chrono::seconds _timeout;
-        std::size_t _sessionId;
-    };
+    fs::path _storageDir;
+    Acceptor _acceptor;
+    std::chrono::seconds _timeout;
+    std::size_t _sessionId;
+  };
 }  // namespace net
