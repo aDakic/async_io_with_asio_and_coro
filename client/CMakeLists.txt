@@ -1,9 +1,9 @@
 set(SOURCES main.cpp)
 
-add_executable(Client ${SOURCES})
+add_executable(client ${SOURCES})
 target_link_libraries(
- Client PRIVATE recorder_asio::exe 
-                recorder_asio::gst 
-                recorder_asio::net 
-                recorder_asio::dir
-                recorder_asio::po)
+    client PRIVATE camera_asio::exe 
+                   camera_asio::gst 
+                   camera_asio::net 
+                   camera_asio::dir
+                   camera_asio::po)

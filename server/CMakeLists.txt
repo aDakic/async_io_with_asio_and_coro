@@ -11,10 +11,10 @@ find_package(Qt5
     REQUIRED COMPONENTS Core Gui Widgets)
 
 target_link_libraries(
-        server PRIVATE recorder_asio::exe 
-                       recorder_asio::net
-                       recorder_asio::dir
-                       recorder_asio::po)
+        server PRIVATE camera_asio::exe 
+                       camera_asio::net
+                       camera_asio::dir
+                       camera_asio::po)
 
 target_link_libraries(
         server PRIVATE Qt5::Core
